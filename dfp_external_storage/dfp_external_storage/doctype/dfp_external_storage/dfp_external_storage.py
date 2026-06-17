@@ -608,6 +608,11 @@ def hook_file_before_save(doc, method):
 	This method is called before the document is saved to DB (insert or update row)
 	Critical fields: dfp_external_storage_s3_key, dfp_external_storage and file_url
 	"""
+	# framework#120: DFP File hooks must skip Files that are not DFP-managed (e.g.
+	# Frappe Drive Files, where the override class did not apply) instead of
+	# raising AttributeError and breaking the other app File creation.
+	if not hasattr(doc, "dfp_external_storage_upload_file"):
+		return
 	previous = doc.get_doc_before_save()
 
 	if not previous:
@@ -673,6 +678,8 @@ def hook_file_on_update(doc, method):
 
 def hook_file_after_delete(doc, method):
 	"Called after a document is deleted"
+	if not hasattr(doc, "dfp_external_storage_delete_file"):
+		return
 	doc.dfp_external_storage_delete_file()
 
 
