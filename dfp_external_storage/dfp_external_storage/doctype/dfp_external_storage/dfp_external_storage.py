@@ -369,6 +369,17 @@ class DFPExternalStorageFile(File):
 
 	def dfp_external_storage_ignored_doctypes(self):
 		"Do not apply for files attached to specified doctypes"
+		# framework#70: ERPNext stock reposting writes an internal .json.gz temp
+		# file (a File with attached_to_field="reposting_data_file", on "Repost
+		# Item Valuation") and reads it back via File.get_full_path(), which
+		# requires a LOCAL filesystem path. Uploading it to external storage
+		# rewrites file_url to "/file/<name>/..." and breaks reposting with
+		# "Cannot access file path". These temp files must NEVER leave local disk,
+		# regardless of the connection's configurable doctypes_ignored list, so
+		# guard on ERPNext's own marker field (it exists only on Repost Item
+		# Valuation).
+		if getattr(self, "attached_to_field", None) == "reposting_data_file":
+			return True
 		if self.attached_to_doctype and self.dfp_external_storage_doc and self.attached_to_doctype in [i.doctype_to_ignore for i in self.dfp_external_storage_doc.doctypes_ignored]:
 			frappe.msgprint(_("""This doctype does not allow remote files attached to it. Check "DFP External Storage" advanced settings for more details."""))
 			return True
