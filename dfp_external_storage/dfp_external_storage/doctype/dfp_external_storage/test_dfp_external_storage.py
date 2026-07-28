@@ -115,3 +115,137 @@ class TestDFPExternalStorage(FrappeTestCase):
 		timeout = http_client.connection_pool_kw["timeout"]
 		self.assertEqual(timeout.connect_timeout, DFP_S3_CONNECT_TIMEOUT)
 		self.assertEqual(timeout._read, DFP_S3_READ_TIMEOUT)
+
+	def test_longest_prefix_basic_and_empty(self):
+		"""framework#102: file-type routing matches a File's guessed mime type
+		against a storage's newline-separated `route_mimetypes_starting` prefixes.
+		The matcher must strip whitespace, drop blank lines, return the LONGEST
+		matching prefix (most specific wins), and return None when either input is
+		empty or nothing matches (feature off)."""
+		# matches, strips whitespace, drops blank lines
+		self.assertEqual(
+			dfp_mod.dfp_mimetype_longest_prefix("image/png", " image/ \n\n video/ "),
+			"image/",
+		)
+		# most-specific (longest) prefix wins within one storage's list
+		self.assertEqual(
+			dfp_mod.dfp_mimetype_longest_prefix("image/png", "image/\nimage/png"),
+			"image/png",
+		)
+		# no match
+		self.assertIsNone(dfp_mod.dfp_mimetype_longest_prefix("application/pdf", "image/"))
+		# empty inputs => feature off
+		self.assertIsNone(dfp_mod.dfp_mimetype_longest_prefix("image/png", ""))
+		self.assertIsNone(dfp_mod.dfp_mimetype_longest_prefix(None, "image/"))
+
+	def test_route_by_mimetype_precedence(self):
+		"""framework#102: across ENABLED storages, the storage with the longest
+		matching prefix wins; an exact-length tie breaks on the lowest storage name
+		so routing is always deterministic. No match / empty => None (legacy)."""
+		# longest prefix across storages wins (most specific)
+		self.assertEqual(
+			dfp_mod.dfp_storage_route_by_mimetype(
+				"image/png", [("A", "image/"), ("B", "image/png")]
+			),
+			"B",
+		)
+		# equal-length tie => lowest name wins (deterministic)
+		self.assertEqual(
+			dfp_mod.dfp_storage_route_by_mimetype(
+				"image/png", [("Z", "image/"), ("A", "image/")]
+			),
+			"A",
+		)
+		# no match / empty inputs
+		self.assertIsNone(
+			dfp_mod.dfp_storage_route_by_mimetype("application/pdf", [("A", "image/")])
+		)
+		self.assertIsNone(dfp_mod.dfp_storage_route_by_mimetype(None, [("A", "image/")]))
+		self.assertIsNone(dfp_mod.dfp_storage_route_by_mimetype("image/png", []))
+
+	def _run_resolver(self, *, explicit, mimetype, folder, storages):
+		"""Drive DFPExternalStorageFile.dfp_external_storage_doc with fakes.
+
+		`storages` maps storage name -> {"enabled", "route_mimetypes_starting"}.
+		Emulates the enabled + `route_mimetypes_starting IS SET` query filter and
+		returns the resolved storage name (or None). No DB, no network.
+		"""
+		fake_self = SimpleNamespace(
+			dfp_external_storage=explicit,
+			folder=folder,
+			dfp_mime_type_guess_by_file_name=mimetype,
+		)
+
+		def fake_get_all(doctype, filters=None, fields=None, **kw):
+			filters = filters or {}
+			rows = []
+			for name, cfg in storages.items():
+				if filters.get("enabled") == 1 and not cfg["enabled"]:
+					continue
+				if filters.get("route_mimetypes_starting") == ["is", "set"] and not cfg["route_mimetypes_starting"]:
+					continue
+				rows.append(SimpleNamespace(
+					name=name, route_mimetypes_starting=cfg["route_mimetypes_starting"]))
+			return rows
+
+		def fake_get_doc(doctype, name):
+			return SimpleNamespace(name=name)
+
+		def fake_get_value(doctype, fieldname=None, filters=None, **kw):
+			# Folder routing fallback is not exercised by these tests (no storage is
+			# folder-bound here), so return None to drive the type/Home paths.
+			return None
+
+		orig = (dfp_mod.frappe.get_all, dfp_mod.frappe.get_doc, dfp_mod.frappe.db.get_value)
+		dfp_mod.frappe.get_all, dfp_mod.frappe.get_doc, dfp_mod.frappe.db.get_value = (
+			fake_get_all, fake_get_doc, fake_get_value)
+		try:
+			# Call the raw cached_property functions to bypass instance caching.
+			by_mime = DFPExternalStorageFile.dfp_external_storage_doc_by_mimetype.func(fake_self)
+			fake_self.dfp_external_storage_doc_by_mimetype = by_mime
+			doc = DFPExternalStorageFile.dfp_external_storage_doc.func(fake_self)
+		finally:
+			dfp_mod.frappe.get_all, dfp_mod.frappe.get_doc, dfp_mod.frappe.db.get_value = orig
+		return doc.name if doc else None
+
+	def test_type_routing_matches_enabled_storage(self):
+		"""framework#102 T1: an image with a storage configured for image/ routes
+		to that storage (no explicit selection, no folder binding)."""
+		self.assertEqual(self._run_resolver(
+			explicit=None, mimetype="image/png", folder="Home",
+			storages={"A": {"enabled": 1, "route_mimetypes_starting": "image/"}},
+		), "A")
+
+	def test_explicit_field_wins_over_type(self):
+		"""framework#102 T3: an explicit dfp_external_storage on the File wins over
+		type routing — the mime resolver must never be consulted."""
+		self.assertEqual(self._run_resolver(
+			explicit="EXPLICIT", mimetype="image/png", folder="Home",
+			storages={"A": {"enabled": 1, "route_mimetypes_starting": "image/"}},
+		), "EXPLICIT")
+
+	def test_disabled_storage_never_routed(self):
+		"""framework#102 T4: a disabled storage is never selected even if its prefix
+		matches (the query filters enabled=1)."""
+		self.assertIsNone(self._run_resolver(
+			explicit=None, mimetype="image/png", folder="Home",
+			storages={"A": {"enabled": 0, "route_mimetypes_starting": "image/"}},
+		))
+
+	def test_nonmatching_type_falls_through(self):
+		"""framework#102 T2/T6: a non-matching mime type yields no type match, so
+		resolution falls through to folder/Home (here None => legacy behaviour)."""
+		self.assertIsNone(self._run_resolver(
+			explicit=None, mimetype="application/pdf", folder="Home",
+			storages={"A": {"enabled": 1, "route_mimetypes_starting": "image/"}},
+		))
+
+	def test_type_routing_needs_no_folder_assignment(self):
+		"""framework#102 (addendum): a storage with NO folder assigned but a matching
+		`route_mimetypes_starting` is still resolved for a matching file. `_run_resolver`
+		makes the folder lookup return None (no DFP-by-folder rows), so only the mime
+		route can select storage A — proving folder assignment is optional for routing."""
+		self.assertEqual(self._run_resolver(
+			explicit=None, mimetype="image/png", folder="Some/Unbound/Folder",
+			storages={"A": {"enabled": 1, "route_mimetypes_starting": "image/"}},
+		), "A")

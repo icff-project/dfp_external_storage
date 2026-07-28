@@ -197,6 +197,42 @@ def dfp_bounded_http_client() -> urllib3.PoolManager:
 	)
 
 
+def dfp_mimetype_longest_prefix(mimetype, route_mimetypes_starting):
+	"""Return the longest configured mime prefix that ``mimetype`` starts with.
+
+	``route_mimetypes_starting`` is the newline-separated per-storage field (same
+	format as ``presigned_mimetypes_starting``): whitespace is stripped and blank
+	lines dropped. Returns the most specific (longest) matching prefix, or ``None``
+	when either input is empty or nothing matches — i.e. type routing is off.
+	"""
+	if not mimetype or not route_mimetypes_starting:
+		return None
+	prefixes = [p.strip() for p in route_mimetypes_starting.split("\n") if p.strip()]
+	matches = [p for p in prefixes if mimetype.startswith(p)]
+	return max(matches, key=len) if matches else None
+
+
+def dfp_storage_route_by_mimetype(mimetype, routes):
+	"""Pick the storage a File of ``mimetype`` should route to, or ``None``.
+
+	``routes`` is an iterable of ``(storage_name, route_mimetypes_starting)`` pairs
+	for the ENABLED storages only (the caller is responsible for that filter). The
+	most specific match wins (longest matching prefix); an exact-length tie is
+	broken by the lowest storage name so the result is always deterministic.
+	"""
+	if not mimetype:
+		return None
+	matches = []
+	for name, route_mimetypes_starting in routes:
+		prefix = dfp_mimetype_longest_prefix(mimetype, route_mimetypes_starting)
+		if prefix:
+			matches.append((len(prefix), name))
+	if not matches:
+		return None
+	matches.sort(key=lambda m: (-m[0], m[1]))
+	return matches[0][1]
+
+
 class MinioConnection:
 	def __init__(self, endpoint:str, access_key:str, secret_key:str, region:str, secure:bool):
 		self.client = Minio(
@@ -361,14 +397,19 @@ class DFPExternalStorageFile(File):
 				dfp_ext_strg_doc = frappe.get_doc("DFP External Storage", self.dfp_external_storage)
 			except:
 				pass
+		# 2. File-type routing: enabled storage whose mime prefix matches, evaluated
+		# BEFORE folder routing so e.g. images always reach their bucket even when
+		# they land in Home/Attachments. No-op when no storage configures routing.
 		if not dfp_ext_strg_doc:
-			# 2. Specific folder connection
+			dfp_ext_strg_doc = self.dfp_external_storage_doc_by_mimetype
+		if not dfp_ext_strg_doc:
+			# 3. Specific folder connection
 			dfp_ext_strg_name = frappe.db.get_value(
 				"DFP External Storage by Folder",
 				fieldname="parent",
 				filters={ "folder": self.folder }
 			)
-			# 3. Default connection (Home folder)
+			# 4. Default connection (Home folder)
 			if not dfp_ext_strg_name:
 				dfp_ext_strg_name = frappe.db.get_value(
 					"DFP External Storage by Folder",
@@ -378,6 +419,31 @@ class DFPExternalStorageFile(File):
 			if dfp_ext_strg_name:
 				dfp_ext_strg_doc = frappe.get_doc("DFP External Storage", dfp_ext_strg_name)
 		return dfp_ext_strg_doc
+
+	@cached_property
+	def dfp_external_storage_doc_by_mimetype(self):
+		"""File-type routing: the ENABLED storage whose ``route_mimetypes_starting``
+		prefix best matches this File's guessed mime type, or ``None``.
+
+		Only reached when the File has no explicit connection. The query is filtered
+		to enabled storages that actually declare routing prefixes, so when nobody
+		configures routing it returns nothing and behaviour is identical to before
+		the feature (zero-cost, fully backward compatible).
+		"""
+		mimetype = self.dfp_mime_type_guess_by_file_name
+		if not mimetype:
+			return None
+		routes = frappe.get_all(
+			"DFP External Storage",
+			filters={"enabled": 1, "route_mimetypes_starting": ["is", "set"]},
+			fields=["name", "route_mimetypes_starting"],
+		)
+		name = dfp_storage_route_by_mimetype(
+			mimetype, [(r.name, r.route_mimetypes_starting) for r in routes]
+		)
+		if name:
+			return frappe.get_doc("DFP External Storage", name)
+		return None
 
 	def dfp_is_s3_remote_file(self):
 		if self.dfp_external_storage_s3_key and self.dfp_external_storage_doc:
