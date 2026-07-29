@@ -249,3 +249,90 @@ class TestDFPExternalStorage(FrappeTestCase):
 			explicit=None, mimetype="image/png", folder="Some/Unbound/Folder",
 			storages={"A": {"enabled": 1, "route_mimetypes_starting": "image/"}},
 		), "A")
+
+	def _make_storage(self, bucket, folder):
+		"""Insert a DFP External Storage bound to `folder`, network-isolated.
+
+		validate_bucket() is stubbed for the whole test (patched in the test body)
+		so no S3 connection is attempted. FrappeTestCase rolls the transaction back
+		in tearDown, so the storage + its child row never persist.
+		"""
+		import frappe
+
+		doc = frappe.get_doc({
+			"doctype": "DFP External Storage",
+			"title": bucket,
+			"type": "S3 Compatible",
+			"endpoint": "s3.example.test",
+			"region": "us-east-1",
+			"bucket_name": bucket,
+			"folders": [{"folder": folder}],
+		})
+		doc.insert(ignore_permissions=True)
+		return doc
+
+	def test_folder_picker_query_contract(self):
+		"""framework#102 regression (follow-up to bug-153): the DFP External Storage
+		form's folder-picker reads the folder→storage assignment map with
+		``frappe.db.get_list('DFP External Storage by Folder', …)``, which forwards
+		every option verbatim to ``frappe.desk.reportview.get_list`` →
+		``DatabaseQuery.execute(**args)``.
+
+		Two defects the fix must lock in:
+		  1. Passing ``parent`` (as bug-153 did) crashes every form refresh —
+		     ``execute()`` has no ``parent`` kwarg → TypeError. The picker used
+		     ``parent: 'DFP External Storage'``; the fix uses ``parent_doctype``.
+		  2. Without ``parent_doctype`` the child (istable) doctype's fields are
+		     stripped to ``name`` only (permission resolves against the child, whose
+		     ``permissions`` is empty), so ``parent``/``folder`` come back empty and
+		     the "exclude folders owned by another storage" logic can never work.
+		     ``parent_doctype`` scopes permission to the parent and makes them readable.
+
+		Verified FAIL-before / PASS-after: with ``parent`` the call raises (500 in
+		prod); with ``parent_doctype`` both fields are returned and the ownership
+		exclusion the JS performs selects the correct folders.
+		"""
+		import frappe
+		from frappe.desk import reportview
+
+		# Network isolation: never touch S3 while inserting fixtures.
+		original_validate_bucket = dfp_mod.DFPExternalStorage.validate_bucket
+		dfp_mod.DFPExternalStorage.validate_bucket = lambda self: None
+		try:
+			folder_a = frappe.get_doc({
+				"doctype": "File", "file_name": "dfp-test-folder-a",
+				"is_folder": 1, "folder": "Home",
+			}).insert(ignore_permissions=True).name
+			folder_b = frappe.get_doc({
+				"doctype": "File", "file_name": "dfp-test-folder-b",
+				"is_folder": 1, "folder": "Home",
+			}).insert(ignore_permissions=True).name
+
+			storage_a = self._make_storage("dfp-test-a", folder_a).name
+			storage_b = self._make_storage("dfp-test-b", folder_b).name
+
+			# Defect 1: the bug-153 kwarg crashes — this is the exact production 500.
+			with self.assertRaises(TypeError):
+				reportview.execute(
+					"DFP External Storage by Folder",
+					fields=["parent", "folder"],
+					parent="DFP External Storage",
+				)
+
+			# Defect 2 + fix: parent_doctype returns the real child fields.
+			rows = reportview.execute(
+				"DFP External Storage by Folder",
+				fields=["parent", "folder"],
+				parent_doctype="DFP External Storage",
+			)
+			by_folder = {r["folder"]: r["parent"] for r in rows}
+			self.assertEqual(by_folder.get(folder_a), storage_a)
+			self.assertEqual(by_folder.get(folder_b), storage_b)
+
+			# The exclusion the JS performs on those rows: for storage A the picker
+			# must hide only folder_b (owned by B), never folder_a (its own).
+			owned_by_others = [r["folder"] for r in rows if r["parent"] != storage_a]
+			self.assertIn(folder_b, owned_by_others)
+			self.assertNotIn(folder_a, owned_by_others)
+		finally:
+			dfp_mod.DFPExternalStorage.validate_bucket = original_validate_bucket

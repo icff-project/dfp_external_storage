@@ -31,12 +31,22 @@ frappe.ui.form.on('DFP External Storage', {
 		// Exclude only folders already owned by a DIFFERENT storage, so the
 		// "one folder -> one storage" invariant holds without hiding unassigned
 		// folders or this storage's own already-assigned folders. `parent` is the
-		// owning storage's docname; `folder` is the assigned File folder. (The
-		// previous code compared the CHILD row `name` to the PARENT docname — they
-		// never match, so it wrongly excluded every assigned folder.)
+		// owning storage's docname; `folder` is the assigned File folder.
+		//
+		// `parent_doctype` (NOT `parent`) is the reportview kwarg that scopes a child
+		// (istable) doctype query to its parent. Two reasons it is required here:
+		//   1. `frappe.db.get_list` forwards every option verbatim to
+		//      `frappe.desk.reportview.get_list` -> `DatabaseQuery.execute(**args)`.
+		//      `execute()` accepts `parent_doctype` but has NO `parent` kwarg, so the
+		//      old `parent:` option 500'd every form refresh with
+		//      `TypeError: DatabaseQuery.execute() got an unexpected keyword argument 'parent'`.
+		//   2. Without `parent_doctype`, reportview resolves field permission against
+		//      the child doctype itself (empty permissions) and strips every field but
+		//      `name` — so `parent`/`folder` came back empty and the exclusion never
+		//      worked. Scoping to the parent doctype makes both fields readable.
 		frappe.db.get_list(
 			'DFP External Storage by Folder',
-			{fields: ['parent', 'folder'], parent: 'DFP External Storage'}
+			{fields: ['parent', 'folder'], parent_doctype: 'DFP External Storage'}
 		).then(data => {
 			let folders_owned_by_other_storages = (data || [])
 				.filter(d => d.parent != frm.doc.name)
