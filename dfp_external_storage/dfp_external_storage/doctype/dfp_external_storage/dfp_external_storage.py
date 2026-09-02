@@ -5,6 +5,7 @@ import io
 import mimetypes
 import typing as t
 from datetime import timedelta
+from urllib.parse import quote
 from werkzeug.wrappers import Response
 from werkzeug.wsgi import wrap_file
 from functools import cached_property
@@ -23,6 +24,13 @@ DFP_EXTERNAL_STORAGE_PUBLIC_CACHE_PREFIX = "external_storage_public_file:"
 # http://[host:port]/<file>/[File:name]/[File:file_name]
 # http://myhost.localhost:8000/file/c7baa5b2ff/my-image.png
 DFP_EXTERNAL_STORAGE_URL_SEGMENT_FOR_FILE_LOAD = "file"
+
+# frappe.website.path_resolver.resolve_path() strips a trailing ".html" from the
+# endpoint BEFORE the renderer chain runs, so that "/about.html" serves the
+# "about" template. Files on external storage are resolved by that router — local
+# ones are not, frappe/app.py serves "/private/files/…" ahead of it — so an .html
+# file reaches the renderer without its extension. framework#168.
+DFP_FRAPPE_ROUTER_STRIPPED_SUFFIX = ".html"
 
 
 DFP_EXTERNAL_STORAGE_CONNECTION_FIELDS = [
@@ -865,6 +873,40 @@ def hook_file_after_delete(doc, method):
 	doc.dfp_external_storage_delete_file()
 
 
+def dfp_file_name_matches_request(stored_file_name:str, requested:str) -> bool:
+	"""True when `requested` names `stored_file_name`, allowing for the router.
+
+	The file is resolved by docname, which is authoritative; comparing the name
+	is a consistency guard. This re-attaches the ONE suffix frappe's router
+	removes (framework#168) and nothing else, so a bare "report" still cannot
+	name "report.pdf".
+	"""
+	if not stored_file_name or not requested:
+		return False
+	if stored_file_name == requested:
+		return True
+	return stored_file_name == f"{requested}{DFP_FRAPPE_ROUTER_STRIPPED_SUFFIX}"
+
+
+def dfp_force_download_header(file_name:str):
+	"""Frappe's own force-download header for `file_name`, or None.
+
+	Mirrors what `frappe.utils.response.send_private_file` does for a local
+	private file: HTML/SVG/XML served INLINE from the site origin executes with
+	the site's cookies, so frappe never serves those inline. External storage
+	must not be the weaker path. The extension list is IMPORTED rather than
+	re-listed — a second copy drifts from the one frappe actually enforces —
+	and a frappe without the list forces nothing, so there is nothing to mirror.
+	"""
+	try:
+		from frappe.utils.response import FORCE_DOWNLOAD_EXTENSIONS
+	except ImportError:
+		return None
+	if os.path.splitext(file_name or "")[1].lower() not in FORCE_DOWNLOAD_EXTENSIONS:
+		return None
+	return ("Content-Disposition", f"attachment; filename*=UTF-8''{quote(file_name)}")
+
+
 class DFPExternalStorageFileRenderer:
 	def __init__(self, path, status_code=None):
 		self.path = path
@@ -872,7 +914,15 @@ class DFPExternalStorageFileRenderer:
 		self._regex = None
 
 	def _regexed_path(self):
-		self._regex = re.search(fr"{DFP_EXTERNAL_STORAGE_URL_SEGMENT_FOR_FILE_LOAD}\/(.+)\/(.+\.\w+)$", self.path)
+		# Anchored on the url segment, and WITHOUT an extension requirement:
+		# frappe's router strips a trailing ".html" from the endpoint before any
+		# renderer sees it, so requiring an extension made every .html file
+		# unservable — the path fell through to frappe's PrintPage, which claims
+		# it because "file" matches the File DocType case-insensitively, and died
+		# with "ImportError: file" (framework#168). Both groups are single path
+		# segments: a file url is always "/file/<name>/<file_name>".
+		self._regex = re.search(
+			rf"^\/?{DFP_EXTERNAL_STORAGE_URL_SEGMENT_FOR_FILE_LOAD}\/([^\/]+)\/([^\/]+)$", self.path)
 
 	def file_id_get(self):
 		if self.can_render():
@@ -903,7 +953,7 @@ def file(name:str, file:str):
 		except frappe.DoesNotExistError:
 			raise frappe.PageDoesNotExistError()
 
-		if doc.file_name != file:
+		if not dfp_file_name_matches_request(doc.file_name, file):
 			raise frappe.PageDoesNotExistError()
 
 		if not doc.is_downloadable():
@@ -933,6 +983,10 @@ def file(name:str, file:str):
 
 		if doc.dfp_mime_type_guess_by_file_name:
 			response_values["mimetype"] = doc.dfp_mime_type_guess_by_file_name
+		# Set before the cache write below, so a cached response carries it too.
+		download_header = dfp_force_download_header(doc.file_name)
+		if download_header:
+			response_values["headers"].append(download_header)
 		response_values["status"] = 200
 
 		if doc.dfp_is_cacheable():
