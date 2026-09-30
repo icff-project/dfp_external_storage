@@ -83,6 +83,19 @@ class DFPExternalStorage(Document):
 			frappe.msgprint(_("Stream buffer size must be at least of 8192 bytes."))
 			self.stream_buffer_size = 8192
 
+		# framework#240: refuse the presign-everything configuration rather than repairing
+		# the one row someone remembers. On a sibling stack this outage was fixed by setting
+		# "video/" on the storage and then RECURRED through a new record created without it.
+		if dfp_presign_allowlist_is_unsafe(self.presigned_urls, self.presigned_mimetypes_starting):
+			frappe.throw(
+				_("Presigned urls are enabled but no mimetypes are listed, which presigns EVERY "
+				  "file. S3 then serves each one with whatever content type it was uploaded with, "
+				  "so a stylesheet can be dropped by the browser and render the site unstyled with "
+				  "nothing appearing in any log. List the mimetypes to presign (for example "
+				  "<code>video/</code>), or disable presigned urls."),
+				title=_("Unsafe presigned url configuration"),
+			)
+
 		# Recheck S3 connection if needed
 		previous = self.get_doc_before_save()
 		if previous:
@@ -197,6 +210,42 @@ def dfp_bounded_http_client() -> urllib3.PoolManager:
 	)
 
 
+def dfp_presign_mimetype_prefixes(mimetypes_starting):
+	"""Parse a newline-separated mime-prefix field into its real prefixes.
+
+	The one parser for this field format. ``presigned_mimetypes_starting`` and
+	``route_mimetypes_starting`` are both newline-separated Small Text: whitespace is
+	stripped and blank lines dropped. A never-set column reads back as ``None``.
+
+	Extracted because the same three-line comprehension had been written out at every
+	call site, so a field holding only whitespace parsed to nothing in one place while
+	looking configured in another. Every caller must use this, or the presign guard and
+	the presign decision can disagree about whether the same field is empty.
+	"""
+	if not mimetypes_starting:
+		return []
+	return [p.strip() for p in mimetypes_starting.split("\n") if p.strip()]
+
+
+def dfp_presign_allowlist_is_unsafe(presigned_urls, presigned_mimetypes_starting):
+	"""Is this the presign-everything hazard? (PR-Foundry/framework#240)
+
+	``dfp_presigned_url_get`` applies the allow-list only inside a conditional that an
+	empty list makes falsy, so an enabled storage with no prefixes presigns EVERY file.
+	A presigned url 301s to S3, which serves whatever ContentType the upload set
+	(``application/octet-stream`` when unset); dfp's own mimetype guess is applied only
+	on the streaming path, so a redirect never carries it. Browsers sniff images, so
+	images survive M-bM-^@M-^T stylesheets do not, and a dropped stylesheet renders the whole
+	site unstyled with nothing 404ing and no server-side log of any kind.
+
+	Presigning switched OFF is always safe: the allow-list is then irrelevant, and an
+	empty one is the normal configuration for a proxying storage.
+	"""
+	if not presigned_urls:
+		return False
+	return not dfp_presign_mimetype_prefixes(presigned_mimetypes_starting)
+
+
 def dfp_mimetype_longest_prefix(mimetype, route_mimetypes_starting):
 	"""Return the longest configured mime prefix that ``mimetype`` starts with.
 
@@ -207,7 +256,7 @@ def dfp_mimetype_longest_prefix(mimetype, route_mimetypes_starting):
 	"""
 	if not mimetype or not route_mimetypes_starting:
 		return None
-	prefixes = [p.strip() for p in route_mimetypes_starting.split("\n") if p.strip()]
+	prefixes = dfp_presign_mimetype_prefixes(route_mimetypes_starting)
 	matches = [p for p in prefixes if mimetype.startswith(p)]
 	return max(matches, key=len) if matches else None
 
@@ -708,9 +757,16 @@ class DFPExternalStorageFile(File):
 	def dfp_presigned_url_get(self):
 		if not self.dfp_is_s3_remote_file() or not self.dfp_external_storage_doc.presigned_urls:
 			return
+		# Gate on the RAW field, NOT on the parsed list. A whitespace-only value is truthy
+		# here but parses to no prefixes, so `any(...)` over an empty list refuses the
+		# presign — gating on the parsed list instead would flip that one case from
+		# "presign nothing" to "presign everything", which is the hazard framework#240
+		# exists to remove. Behaviour here is deliberately unchanged; the unsafe
+		# configuration is refused at save time by DFPExternalStorage.validate() instead.
+		# Pinned by client_app.tests.test_dfp_presign_allowlist.
 		if self.dfp_external_storage_doc.presigned_mimetypes_starting and self.dfp_mime_type_guess_by_file_name:
-			# get list exploding by new line, removing empty lines and cleaning starting and ending spaces
-			presigned_mimetypes_starting = [i.strip() for i in self.dfp_external_storage_doc.presigned_mimetypes_starting.split("\n") if i.strip()]
+			presigned_mimetypes_starting = dfp_presign_mimetype_prefixes(
+				self.dfp_external_storage_doc.presigned_mimetypes_starting)
 			if not any(self.dfp_mime_type_guess_by_file_name.startswith(i) for i in presigned_mimetypes_starting):
 				return
 		return self.dfp_external_storage_client.presigned_get_object(bucket_name=self.dfp_external_storage_doc.bucket_name, object_name=self.dfp_external_storage_s3_key, expires=self.dfp_external_storage_doc.setting_presigned_url_expiration)
