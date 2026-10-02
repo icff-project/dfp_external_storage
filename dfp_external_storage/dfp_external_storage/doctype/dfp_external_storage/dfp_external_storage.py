@@ -763,11 +763,24 @@ class DFPExternalStorageFile(File):
 		# "presign nothing" to "presign everything", which is the hazard framework#240
 		# exists to remove. Behaviour here is deliberately unchanged; the unsafe
 		# configuration is refused at save time by DFPExternalStorage.validate() instead.
-		# Pinned by client_app.tests.test_dfp_presign_allowlist.
-		if self.dfp_external_storage_doc.presigned_mimetypes_starting and self.dfp_mime_type_guess_by_file_name:
+		# Pinned by icff_membership.tests.test_dfp_presign_allowlist.
+		if self.dfp_external_storage_doc.presigned_mimetypes_starting:
+			# framework#188: FAIL CLOSED when the mimetype cannot be determined.
+			# `mimetypes.guess_type` returns None for an extensionless or
+			# unknown-extension name, and the old condition
+			# (`allowlist and mime_guess`) then went falsy and fell THROUGH to
+			# presigning — so an allow-list that could not be evaluated was silently
+			# bypassed, and a private member document with no extension got a
+			# 3-hour bearer URL despite the allow-list naming only `video/`.
+			# An allow-list we cannot evaluate must refuse, not grant; the file then
+			# streams through Frappe, which applies both the correct Content-Type and
+			# the per-request permission check.
+			mime_guess = self.dfp_mime_type_guess_by_file_name
+			if not mime_guess:
+				return
 			presigned_mimetypes_starting = dfp_presign_mimetype_prefixes(
 				self.dfp_external_storage_doc.presigned_mimetypes_starting)
-			if not any(self.dfp_mime_type_guess_by_file_name.startswith(i) for i in presigned_mimetypes_starting):
+			if not any(mime_guess.startswith(i) for i in presigned_mimetypes_starting):
 				return
 		return self.dfp_external_storage_client.presigned_get_object(bucket_name=self.dfp_external_storage_doc.bucket_name, object_name=self.dfp_external_storage_s3_key, expires=self.dfp_external_storage_doc.setting_presigned_url_expiration)
 
