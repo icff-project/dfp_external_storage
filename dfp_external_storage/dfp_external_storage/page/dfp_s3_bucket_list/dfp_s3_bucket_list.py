@@ -6,6 +6,11 @@ import frappe
 
 @frappe.whitelist()
 def get_info(storage=None, template=None, file_type=None) -> list[dict]:
+	# framework#229: page roles only gate opening the Desk page, not this endpoint, and
+	# frappe.get_doc below checks nothing, so any logged-in user could list every object
+	# key in the bucket. Enforce the page's own role (dfp_s3_bucket_list.json).
+	frappe.only_for("Administrator", message=True)
+
 	files = []
 
 	document = "DFP External Storage"
